@@ -1,0 +1,48 @@
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include:
+      - src/api-reportes/**
+      - src/apache-hop/**
+
+variables:
+  ACR_SERVICE_CONNECTION: "acr-fintech-sc"
+
+stages:
+
+- stage: BuildAndPush
+  displayName: "Build y Push imagenes"
+  jobs:
+
+  - job: BuildApiReportes
+    displayName: "API .NET → ACR"
+    pool:
+      vmImage: "ubuntu-latest"
+    steps:
+    - task: Docker@2
+      displayName: "Build API Reportes"
+      inputs:
+        containerRegistry: $(ACR_SERVICE_CONNECTION)
+        repository: "api-reportes"
+        command: buildAndPush
+        dockerfile: "src/api-reportes/Dockerfile"
+        tags: |
+          $(Build.SourceVersion)
+          latest
+
+  - job: BuildApacheHop
+    displayName: "Apache Hop → ACR"
+    pool:
+      vmImage: "ubuntu-latest"
+    steps:
+    - task: Docker@2
+      displayName: "Build Apache Hop + pipelines ETL"
+      inputs:
+        containerRegistry: $(ACR_SERVICE_CONNECTION)
+        repository: "apache-hop"
+        command: buildAndPush
+        dockerfile: "src/apache-hop/Dockerfile"
+        tags: |
+          $(Build.SourceVersion)
+          2.9.0
