@@ -1,0 +1,260 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - modules/**
+      - "*.tf"
+      - "*.tfvars"
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  TF_SERVICE_CONNECTION: "azure-fintech-sc"
+  TF_BACKEND_RG:         "rg-terraform-state"
+  TF_BACKEND_SA:         "tfstatefintech"
+  TF_BACKEND_CONTAINER:  "tfstate"
+  TF_VERSION:            "1.7.5"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+stages:
+
+# ══════════════════════════════════════════════════════════════
+# STAGE 1 — VALIDATE (corre en cada PR y push a main)
+# ══════════════════════════════════════════════════════════════
+- stage: Validate
+  displayName: "Validate — fmt, validate, lint, security"
+  jobs:
+  - job: ValidateTerraform
+    displayName: "Terraform validate"
+    steps:
+
+    - task: TerraformInstaller@1
+      displayName: "Instalar Terraform $(TF_VERSION)"
+      inputs:
+        terraformVersion: $(TF_VERSION)
+
+    - script: terraform fmt -check -recursive
+      displayName: "terraform fmt --check"
+      workingDirectory: $(System.DefaultWorkingDirectory)
+
+    - script: terraform init -backend=false
+      displayName: "terraform init (sin backend)"
+      workingDirectory: $(System.DefaultWorkingDirectory)
+
+    - script: terraform validate
+      displayName: "terraform validate"
+      workingDirectory: $(System.DefaultWorkingDirectory)
+
+    - script: |
+        pip install checkov --quiet
+        checkov -d . --framework terraform --output cli --soft-fail
+      displayName: "checkov security scan"
+      workingDirectory: $(System.DefaultWorkingDirectory)
+
+# ══════════════════════════════════════════════════════════════
+# STAGE 2 — PLAN DEV (solo en merge a main)
+# ══════════════════════════════════════════════════════════════
+- stage: PlanDev
+  displayName: "Plan DEV"
+  dependsOn: Validate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: PlanDev
+    displayName: "terraform plan dev"
+    steps:
+
+    - task: TerraformInstaller@1
+      inputs:
+        terraformVersion: $(TF_VERSION)
+
+    - task: AzureCLI@2
+      displayName: "terraform init — backend dev"
+      inputs:
+        azureSubscription: $(TF_SERVICE_CONNECTION)
+        scriptType: bash
+        addSpnToEnvironment: true
+        inlineScript: |
+          export ARM_CLIENT_ID=$servicePrincipalId
+          export ARM_CLIENT_SECRET=$servicePrincipalKey
+          export ARM_TENANT_ID=$tenantId
+          export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          terraform init \
+            -backend-config="resource_group_name=$(TF_BACKEND_RG)" \
+            -backend-config="storage_account_name=$(TF_BACKEND_SA)" \
+            -backend-config="container_name=$(TF_BACKEND_CONTAINER)" \
+            -backend-config="key=dev.terraform.tfstate"
+      workingDirectory: $(System.DefaultWorkingDirectory)
+
+    - task: AzureCLI@2
+      displayName: "terraform plan dev"
+      inputs:
+        azureSubscription: $(TF_SERVICE_CONNECTION)
+        scriptType: bash
+        addSpnToEnvironment: true
+        inlineScript: |
+          export ARM_CLIENT_ID=$servicePrincipalId
+          export ARM_CLIENT_SECRET=$servicePrincipalKey
+          export ARM_TENANT_ID=$tenantId
+          export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          terraform plan \
+            -var-file="dev.tfvars" \
+            -var="sql_admin_password=$(SQL_ADMIN_PASSWORD)" \
+            -out="dev.tfplan" \
+            -detailed-exitcode
+        scriptLocation: inlineScript
+      workingDirectory: $(System.DefaultWorkingDirectory)
+
+    - task: PublishPipelineArtifact@1
+      displayName: "Publicar plan dev"
+      inputs:
+        targetPath: "$(System.DefaultWorkingDirectory)/dev.tfplan"
+        artifact: "terraform-plan-dev"
+
+# ══════════════════════════════════════════════════════════════
+# STAGE 3 — APPLY DEV (automático tras plan exitoso)
+# ══════════════════════════════════════════════════════════════
+- stage: ApplyDev
+  displayName: "Apply DEV — automático"
+  dependsOn: PlanDev
+  condition: succeeded()
+  jobs:
+  - deployment: ApplyDev
+    displayName: "terraform apply dev"
+    environment: "dev"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Descargar plan dev"
+            inputs:
+              artifact: "terraform-plan-dev"
+              path: $(System.DefaultWorkingDirectory)
+
+          - task: AzureCLI@2
+            displayName: "terraform apply dev"
+            inputs:
+              azureSubscription: $(TF_SERVICE_CONNECTION)
+              scriptType: bash
+              addSpnToEnvironment: true
+              inlineScript: |
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                terraform init \
+                  -backend-config="resource_group_name=$(TF_BACKEND_RG)" \
+                  -backend-config="storage_account_name=$(TF_BACKEND_SA)" \
+                  -backend-config="container_name=$(TF_BACKEND_CONTAINER)" \
+                  -backend-config="key=dev.terraform.tfstate" \
+                  -reconfigure
+                terraform apply -auto-approve "dev.tfplan"
+            workingDirectory: $(System.DefaultWorkingDirectory)
+
+          - task: AzureCLI@2
+            displayName: "Smoke test — AKS dev"
+            inputs:
+              azureSubscription: $(TF_SERVICE_CONNECTION)
+              scriptType: bash
+              inlineScript: |
+                az aks get-credentials \
+                  --resource-group rg-dev-network \
+                  --name aks-dev \
+                  --overwrite-existing
+                kubectl get nodes
+                kubectl get pods -n etl-hop
+                kubectl get pods -n fintech-api
+
+# ══════════════════════════════════════════════════════════════
+# STAGE 4 — PLAN + APPLY PROD (aprobación manual requerida)
+# ══════════════════════════════════════════════════════════════
+- stage: DeployProd
+  displayName: "Deploy PROD — aprobación requerida"
+  dependsOn: ApplyDev
+  condition: succeeded()
+  jobs:
+  - deployment: DeployProd
+    displayName: "terraform apply prod"
+    environment: "prod"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(TF_VERSION)
+
+          - task: AzureCLI@2
+            displayName: "terraform init prod"
+            inputs:
+              azureSubscription: $(TF_SERVICE_CONNECTION)
+              scriptType: bash
+              addSpnToEnvironment: true
+              inlineScript: |
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                terraform init \
+                  -backend-config="resource_group_name=$(TF_BACKEND_RG)" \
+                  -backend-config="storage_account_name=$(TF_BACKEND_SA)" \
+                  -backend-config="container_name=$(TF_BACKEND_CONTAINER)" \
+                  -backend-config="key=prod.terraform.tfstate" \
+                  -reconfigure
+            workingDirectory: $(System.DefaultWorkingDirectory)
+
+          - task: AzureCLI@2
+            displayName: "terraform plan prod"
+            inputs:
+              azureSubscription: $(TF_SERVICE_CONNECTION)
+              scriptType: bash
+              addSpnToEnvironment: true
+              inlineScript: |
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                terraform plan \
+                  -var-file="prod.tfvars" \
+                  -var="sql_admin_password=$(SQL_ADMIN_PASSWORD_PROD)" \
+                  -out="prod.tfplan"
+            workingDirectory: $(System.DefaultWorkingDirectory)
+
+          - task: AzureCLI@2
+            displayName: "terraform apply prod"
+            inputs:
+              azureSubscription: $(TF_SERVICE_CONNECTION)
+              scriptType: bash
+              addSpnToEnvironment: true
+              inlineScript: |
+                export ARM_CLIENT_ID=$servicePrincipalId
+                export ARM_CLIENT_SECRET=$servicePrincipalKey
+                export ARM_TENANT_ID=$tenantId
+                export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                terraform apply -auto-approve "prod.tfplan"
+            workingDirectory: $(System.DefaultWorkingDirectory)
+
+          - task: AzureCLI@2
+            displayName: "Smoke test — AKS prod"
+            inputs:
+              azureSubscription: $(TF_SERVICE_CONNECTION)
+              scriptType: bash
+              inlineScript: |
+                az aks get-credentials \
+                  --resource-group rg-prod-network \
+                  --name aks-prod \
+                  --overwrite-existing
+                kubectl get nodes

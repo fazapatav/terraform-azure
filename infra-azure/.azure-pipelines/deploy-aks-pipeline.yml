@@ -1,0 +1,79 @@
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include:
+      - k8s/**
+
+variables:
+  AKS_SERVICE_CONNECTION: "aks-fintech-sc"
+
+stages:
+
+- stage: DeployDev
+  displayName: "Deploy workloads → AKS dev"
+  jobs:
+  - deployment: DeployDev
+    environment: "dev"
+    pool:
+      vmImage: "ubuntu-latest"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@1
+            displayName: "Deploy Apache Hop CronJob"
+            inputs:
+              action: deploy
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: $(AKS_SERVICE_CONNECTION)
+              azureResourceGroup: "rg-dev-network"
+              kubernetesCluster: "aks-dev"
+              namespace: "etl-hop"
+              manifests: "k8s/hop/*.yaml"
+
+          - task: KubernetesManifest@1
+            displayName: "Deploy API Reportes"
+            inputs:
+              action: deploy
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: $(AKS_SERVICE_CONNECTION)
+              azureResourceGroup: "rg-dev-network"
+              kubernetesCluster: "aks-dev"
+              namespace: "fintech-api"
+              manifests: "k8s/api/*.yaml"
+
+- stage: DeployProd
+  displayName: "Deploy workloads → AKS prod"
+  dependsOn: DeployDev
+  condition: succeeded()
+  jobs:
+  - deployment: DeployProd
+    environment: "prod"
+    pool:
+      vmImage: "ubuntu-latest"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@1
+            displayName: "Deploy Apache Hop CronJob PROD"
+            inputs:
+              action: deploy
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: $(AKS_SERVICE_CONNECTION)
+              azureResourceGroup: "rg-prod-network"
+              kubernetesCluster: "aks-prod"
+              namespace: "etl-hop"
+              manifests: "k8s/hop/*.yaml"
+
+          - task: KubernetesManifest@1
+            displayName: "Deploy API Reportes PROD"
+            inputs:
+              action: deploy
+              connectionType: azureResourceManager
+              azureSubscriptionConnection: $(AKS_SERVICE_CONNECTION)
+              azureResourceGroup: "rg-prod-network"
+              kubernetesCluster: "aks-prod"
+              namespace: "fintech-api"
+              manifests: "k8s/api/*.yaml"
